@@ -1,0 +1,286 @@
+---
+title: "MTN vs TN, (LSTM vs GARCH(1,1))"
+output:
+  pdf_document: default
+date: "2022-12-15"
+---
+
+```{r}
+
+library(sn)
+library(PerformanceAnalytics)
+library(car)
+library(tseries)
+library(forecast)
+library(quantmod)
+library(rugarch)
+library(FinTS)
+library(zoo)
+library(skewt)
+require(skewt)
+library(crch)
+require(crch)
+require(tidyverse)
+library(fGarch)
+library(truncnorm)
+
+#====================================#
+options(digits=4)
+
+dat = read.csv.zoo("000006_v2.csv", header=TRUE, na.strings="null")
+dat = na.omit(dat)
+dat = dat[,"close", drop=F]
+dat.ret = CalculateReturns(dat, method="log")
+dat.ret = as.xts(CalculateReturns(dat, method="log"))
+dat.ret = dat.ret[-1]
+colnames(dat.ret) = "return"
+
+
+#Chinese stocks boundaries (simplied approach)
+ub=log(1.1)*100*0+max(dat.ret)
+lb=log(0.9)*100*0+min(dat.ret)
+
+
+#split data
+#----------------------------------------------------------
+nsplit.dat = which( time(dat.ret[,1]) == "2019-03-29")
+dat.train = dat.ret[1:nsplit.dat]
+#=========================================#
+
+#---------activation function and forwardprop-----------
+actfun = function(x){x}
+sigmoid = function(x){exp(x)/(1+exp(x))}
+lstm.fwdprop = function (x,w){
+  omega = w[1]; alpha = w[2]; beta = w[3]
+  wf = w[4]; af = w[5]; bf = w[6]
+  wi = w[7]; ai = w[8]; bi = w[9]
+  wo = w[10]; ao = w[11]; bo = w[12]
+  
+  sigma2t = rep(mean(x),nrow(x))
+  ot = rep(0, nrow(x))
+  ft = rep(0, nrow(x))
+  it = rep(0, nrow(x))
+  Ct = rep(0, nrow(x))
+  
+  for (k in 2:nrow(x)){
+    ot[k] = sigmoid(wo + ao * x[k] + bo * sigma2t[k-1])
+    ft[k] = sigmoid(wf + af * x[k] + bf * sigma2t[k-1])
+    it[k] = sigmoid(wi + ai * x[k] + bi * sigma2t[k-1])
+    Ct[k] = ft[k]*Ct[k-1] + it[k]*( omega + alpha*x[k] + beta*sigma2t[k-1])
+    sigma2t[k] = ot[k] * Ct[k]
+  }
+  y = sigma2t # indentity function output
+  list (output = y)
+}
+#======================================================
+
+
+# Truncated normal loss function
+loss.fun_tn = function (init.w,x,y,l,u){
+  y.hat = lstm.fwdprop(x,init.w)$output
+  n = length(y)
+  
+  return(-sum(log(truncnorm::dtruncnorm(y,l,u,0,sqrt(y.hat)))))
+}
+
+pie= c(0.96649, 0.01786, 0.01565)
+muu = c(-0.03883, -11.0972,10.49614 )
+sd = c(4.5141, 1.9978, 0.3079) # it is variance
+vec =c(pie,muu,sd)
+
+
+# Truncated Mix Gaussian
+loss.fun_mtn = function (init.w,x,y,l,u,pie1,pie2,pie3,m1,m2,m3,sd1,sd2,sd3){
+  y.hat = lstm.fwdprop(x,init.w)$output
+  n = length(y)
+  
+  return(-sum(log( pie1*truncnorm::dtruncnorm(y,l,u,m1,sd1/(sd1+sd2+sd3)*sqrt(y.hat))
+            +pie2*truncnorm::dtruncnorm(y,l,u,m2,sd2/(sd1+sd2+sd3)*sqrt(y.hat))
+            +pie3*truncnorm::dtruncnorm(y,l,u,m3,sd3/(sd1+sd2+sd3)*sqrt(y.hat)))))
+}
+#===============================================
+
+
+# ==============LSTM========================
+library(Rsolnp)
+
+x = (dat.train^2)[-length(dat.train)]
+y = dat.train[-1]
+init.k = rep(1/length(y),length(y))
+
+#-----------------Truncated normal LSTM engine----------------
+cl = makePSOCKcluster(2)
+clusterExport(cl, c("sigmoid","loss.fun_tn","lstm.fwdprop"))
+lstm_tn = gosolnp(fun = loss.fun_tn,  x = x, y = y, u=ub, l=lb,
+               LB = c(0,0,0,rep(c(-5,-1e3,-1e3),3)),
+               UB = c(0.05,1,1,rep(c(5,1e3,1e3),3)),
+               cluster = cl,
+               rseed = 20811644) 
+stopCluster(cl)
+
+#---------------------MTN LSTM engine-----------------------------------
+cl = makePSOCKcluster(2)
+clusterExport(cl, c("sigmoid","loss.fun_mtn","lstm.fwdprop"))
+lstm_mtn = gosolnp(fun = loss.fun_mtn,  x = x, y = y, u=ub, l=lb,
+               pie1=pie[1],pie2=pie[2],pie3=pie[3],
+               m1=muu[1],m2=muu[2],m3=muu[3],
+               sd1=sd[1],sd2=sd[2],sd3=sd[3],
+               LB = c(0,0,0,rep(c(-5,-1e3,-1e3),3)),
+               UB = c(0.05,1,1,rep(c(5,1e3,1e3),3)),
+               cluster = cl,
+               rseed = 20811644) 
+stopCluster(cl)
+
+
+#===============================================#
+
+#===run Garch(1,1)
+garchfit = function(garch,Lag1){
+  beta.val = rep(mean(Lag1),length(Lag1))
+  for (i in 2:length(Lag1)){
+    beta.val[i] = garch$par[1] + garch$par[2] * Lag1[i] + garch$par[3] * beta.val[i-1]
+  }
+  
+  y.hat.g = garch$par[1] +
+    garch$par[2]*Lag1 +
+    garch$par[3]*beta.val
+  return(y.hat.g)
+}
+
+
+#---------------------------------------------------------------------------
+
+#LSTM MTN and TN fitted 
+y.lstm_tn = lstm.fwdprop(x = dat.ret[-length(dat.ret)]^2, w = lstm_tn$pars )
+y.lstm_mtn = lstm.fwdprop(x = dat.ret[-length(dat.ret)]^2, w = lstm_mtn$pars )
+#==============================================================================
+
+#-----------------Plots---------------------------
+```
+
+```{r echo=FALSE}
+par(mfrow=c(1,1))
+plot(time(dat.ret[-1]),sqrt(as.numeric(unlist(y.lstm_tn)))*100,col="red",lwd=3,type="l",
+     ylim=c(0,30),ylab="Return volatility forecasts",
+     xlab="Time", main="Volatility of LSTM under MTN and TN (000006.SZ)")
+par(new=TRUE)
+plot(time(dat.ret[-1]),sqrt(as.numeric(unlist(y.lstm_mtn)))*100,col="black",lwd=1,type="l",
+     ylim=c(0,30),ylab="Return volatility forecasts",
+     xlab="Time")
+par(new=TRUE)
+legend("topleft",c("LSTM_MTN","LSTM_TN"),col=c("black","red"),lty=c(2,1))
+abline(v=as.numeric(nsplit.dat),lwd=2)
+
+```
+
+```{R }
+# GARCH(1,1)
+garchfit = function(garch,Lag1){
+  beta.val = rep(mean(Lag1),length(Lag1))
+  for (i in 2:length(Lag1)){
+    beta.val[i] = garch$par[1] + garch$par[2] * Lag1[i] + garch$par[3] * beta.val[i-1]
+  }
+
+  y.hat.g = garch$par[1] +
+    garch$par[2]*Lag1 +
+    garch$par[3]*beta.val
+  return(y.hat.g)
+}
+
+
+GARCHfit_tn = function(params,x,y){
+  omega = params[1]
+  alphaL1 = params[2]
+  betaL1 = params[3]
+  n = length(y)
+  
+  sigma2t = rep(mean(x),n)
+  for (i in 2:n){
+    sigma2t[i] = omega + alphaL1 * x[i] + betaL1 * sigma2t[i-1]}
+  
+  sigmat = sqrt(sigma2t)
+  log.likelihood = -sum(log(dtruncnorm(y,lb,ub,0,sigmat) ))
+  return(log.likelihood)
+}
+
+GARCHfit_mtn = function(params,x,y){
+  omega = params[1]
+  alphaL1 = params[2]
+  betaL1 = params[3]
+  n = length(y)
+  
+  sigma2t = rep(mean(x),n)
+  for (i in 2:n){
+    sigma2t[i] = omega + alphaL1 * x[i] + betaL1 * sigma2t[i-1]
+  }
+  sigmat = sqrt(sigma2t)
+  sigmatt_1 = sd[1]/(sd[1]+sd[2]+sd[3])*sigmat
+  sigmatt_2 = sd[2]/(sd[1]+sd[2]+sd[3])*sigmat
+  sigmatt_3 = sd[1]/(sd[1]+sd[2]+sd[3])*sigmat
+  
+  # log.likelihood = -sum(log(dnorm(y, 0, sigmat)))
+  log.likelihood = -sum(log(pie[1]*dtruncnorm(y,lb,ub,muu[1],sigmatt_1)
+                            +pie[2]*dtruncnorm(y,lb,ub,muu[2],sigmatt_2)
+                            +pie[3]*dtruncnorm(y,lb,ub,muu[3],sigmatt_3)))
+  return(log.likelihood)
+}
+
+#----------loss function optimization-----------
+
+init.guess=c(0,rep(0.5,2))
+garch_tn = optim(par = init.guess, fn=GARCHfit_tn,
+              x = (dat.train^2)[-length(dat.train)],
+              y = dat.train[-1],)
+
+garch_mtn = optim(par = init.guess, fn=GARCHfit_mtn,
+              x = (dat.train^2)[-length(dat.train)],
+              y = dat.train[-1],)
+
+#============================================================
+
+#---------------GARCH(1,1) MTN and TN fitted-----------------
+y.garch_tn = garchfit(garch = garch_tn, Lag1 = dat.ret[-length(dat.ret)]^2 )
+y.garch_mtn = garchfit(garch = garch_mtn, Lag1 = dat.ret[-length(dat.ret)]^2 )
+
+# y.garch_tn$pars
+# y.garch_mtn$pars
+#--------Plot-----------------------------------------------
+```
+
+```{r }
+par(mfrow=c(1,1))
+
+plot(sqrt(as.numeric(unlist(y.garch_tn)))*100,col="red",lwd=3,type="l",
+     ylim=c(0,15),ylab="Return volatility forecasts",
+     xlab="Time", main= "Volatility of GARCH(1,1) vs. LSTM (000006.SZ)",)
+points(sqrt(as.numeric(y.garch_mtn))*100,type="l",lty=2)
+legend(x=0,y=15,c("Garch(1,1)","LSTM"),col=c("black","red"), lty=c(2,1))
+```
+
+
+```{r echo=FALSE}
+par(mfrow=c(1,1))
+plot(time(dat.ret[-1]),sqrt(as.numeric(unlist(y.lstm_tn)))*100,col="red",lwd=3,type="l",
+     ylim=c(0,20),ylab="Return volatility forecasts", main="Volatility of LSTM vs GARCH(1,1) under TN", 
+     xlab="Time")
+par(new=TRUE)
+plot(time(dat.ret[-1]),sqrt(as.numeric(y.garch_tn))*100,col="black",lwd=1,type="l",
+     ylim=c(0,20),ylab="Return volatility forecasts",
+     xlab="Time", main="Volatility of LSTM vs GARCH(1,1) under TN")
+legend("topleft",c("GARCH(1,1) TN","LSTM TN"),col=c("black","red"),lty=c(2,1))
+abline(v=as.numeric(nsplit.dat),lwd=2)
+```
+
+```{r echo=FALSE}
+par(mfrow=c(1,1))
+plot(time(dat.ret[-1]),sqrt(as.numeric(unlist(y.lstm_mtn)))*100,col="red",lwd=3,type="l",
+     ylim=c(0,30),ylab="Return volatility forecasts",
+     xlab="Time", main="Volatility of LSTM vs GARCH(1,1) under MTN")
+par(new=TRUE)
+plot(time(dat.ret[-1]),sqrt(as.numeric(y.garch_mtn))*100,col="black",lwd=1,type="l",
+     ylim=c(0,30),ylab="Return volatility forecasts",
+     xlab="Time", main="Volatility of LSTM vs GARCH(1,1) under MTN")
+legend("topleft",c("GARCH(1,1) MTN","LSTM MTN"),col=c("black","red"),lty=c(2,1))
+abline(v=as.numeric(nsplit.dat),lwd=2)
+```
+
