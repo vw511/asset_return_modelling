@@ -1,5 +1,5 @@
 ---
-title: "MTN vs TN, (LSTM vs GARCH(1,1))"
+title: "MTN vs TN in LSTM and GARCH(1,1))"
 output:
   pdf_document: default
 date: "2022-12-15"
@@ -24,30 +24,31 @@ require(tidyverse)
 library(fGarch)
 library(truncnorm)
 
-#====================================#
+
 options(digits=4)
 
-dat = read.csv.zoo("000006_v2.csv", header=TRUE, na.strings="null")
+dat = read.csv.zoo("data/SZ000006.csv", header=TRUE, na.strings="null")
 dat = na.omit(dat)
 dat = dat[,"close", drop=F]
-dat.ret = CalculateReturns(dat, method="log")
 dat.ret = as.xts(CalculateReturns(dat, method="log"))
 dat.ret = dat.ret[-1]
 colnames(dat.ret) = "return"
 
 
-#Chinese stocks boundaries (simplied approach)
-ub=log(1.1)*100*0+max(dat.ret)
-lb=log(0.9)*100*0+min(dat.ret)
+# Chinese stock boundaries (simplified approach)
+ub=max(dat.ret)
+lb=min(dat.ret)
 
 
-#split data
-#----------------------------------------------------------
+# split data
 nsplit.dat = which( time(dat.ret[,1]) == "2019-03-29")
 dat.train = dat.ret[1:nsplit.dat]
-#=========================================#
+```
 
-#---------activation function and forwardprop-----------
+
+## LSTM
+```{r}
+#---------activation function and forward propagation-----------
 actfun = function(x){x}
 sigmoid = function(x){exp(x)/(1+exp(x))}
 lstm.fwdprop = function (x,w){
@@ -69,39 +70,44 @@ lstm.fwdprop = function (x,w){
     Ct[k] = ft[k]*Ct[k-1] + it[k]*( omega + alpha*x[k] + beta*sigma2t[k-1])
     sigma2t[k] = ot[k] * Ct[k]
   }
-  y = sigma2t # indentity function output
+  y = sigma2t # identity function output
   list (output = y)
 }
-#======================================================
 
 
+#---------Loss functions for LSTM-----------
 # Truncated normal loss function
 loss.fun_tn = function (init.w,x,y,l,u){
   y.hat = lstm.fwdprop(x,init.w)$output
   n = length(y)
   
-  return(-sum(log(truncnorm::dtruncnorm(y,l,u,0,sqrt(y.hat)))))
+  return(-sum(log(truncnorm::dtruncnorm(y, l, u, 0, sqrt(y.hat)))))
 }
 
-pie= c(0.96649, 0.01786, 0.01565)
-muu = c(-0.03883, -11.0972,10.49614 )
-sd = c(4.5141, 1.9978, 0.3079) # it is variance
-vec =c(pie,muu,sd)
+# parameters trained from EM
+pie = c(0.96649, 0.01786, 0.01565)
+muu = c(-0.03883, -11.0972, 10.49614 )
+var = c(4.5141, 1.9978, 0.3079) # this is variance
+vec = c(pie,muu,sd)
 
 
-# Truncated Mix Gaussian
-loss.fun_mtn = function (init.w,x,y,l,u,pie1,pie2,pie3,m1,m2,m3,sd1,sd2,sd3){
+loss.fun_mtn = function (init.w,x,y,l,u,pie,mu,var){
   y.hat = lstm.fwdprop(x,init.w)$output
   n = length(y)
+  sum_sd = sum(var)
+    
+  prob_sum = 0
+  for (i in 1:length(pie)) {
+    prob_sum = prob_sum + pie[i]*truncnorm::dtruncnorm(y,l,u,mu[i],var[i]/sum_sd*sqrt(y.hat))
+  }
   
-  return(-sum(log( pie1*truncnorm::dtruncnorm(y,l,u,m1,sd1/(sd1+sd2+sd3)*sqrt(y.hat))
-            +pie2*truncnorm::dtruncnorm(y,l,u,m2,sd2/(sd1+sd2+sd3)*sqrt(y.hat))
-            +pie3*truncnorm::dtruncnorm(y,l,u,m3,sd3/(sd1+sd2+sd3)*sqrt(y.hat)))))
+  return(-sum(log(prob_sum)))
 }
-#===============================================
+```
 
 
-# ==============LSTM========================
+```{r}
+#-------------Train LSTM-------------
 library(Rsolnp)
 
 x = (dat.train^2)[-length(dat.train)]
@@ -119,46 +125,26 @@ lstm_tn = gosolnp(fun = loss.fun_tn,  x = x, y = y, u=ub, l=lb,
 stopCluster(cl)
 
 #---------------------MTN LSTM engine-----------------------------------
+
 cl = makePSOCKcluster(2)
 clusterExport(cl, c("sigmoid","loss.fun_mtn","lstm.fwdprop"))
 lstm_mtn = gosolnp(fun = loss.fun_mtn,  x = x, y = y, u=ub, l=lb,
-               pie1=pie[1],pie2=pie[2],pie3=pie[3],
-               m1=muu[1],m2=muu[2],m3=muu[3],
-               sd1=sd[1],sd2=sd[2],sd3=sd[3],
+               pie = pie, mu = muu, var = var ,
                LB = c(0,0,0,rep(c(-5,-1e3,-1e3),3)),
                UB = c(0.05,1,1,rep(c(5,1e3,1e3),3)),
                cluster = cl,
                rseed = 20811644) 
 stopCluster(cl)
+```
 
-
-#===============================================#
-
-#===run Garch(1,1)
-garchfit = function(garch,Lag1){
-  beta.val = rep(mean(Lag1),length(Lag1))
-  for (i in 2:length(Lag1)){
-    beta.val[i] = garch$par[1] + garch$par[2] * Lag1[i] + garch$par[3] * beta.val[i-1]
-  }
-  
-  y.hat.g = garch$par[1] +
-    garch$par[2]*Lag1 +
-    garch$par[3]*beta.val
-  return(y.hat.g)
-}
-
-
-#---------------------------------------------------------------------------
-
-#LSTM MTN and TN fitted 
+```{r}
+#----------- Forecast with LSTM under MTN and TN assumptions ------------------
 y.lstm_tn = lstm.fwdprop(x = dat.ret[-length(dat.ret)]^2, w = lstm_tn$pars )
 y.lstm_mtn = lstm.fwdprop(x = dat.ret[-length(dat.ret)]^2, w = lstm_mtn$pars )
-#==============================================================================
-
-#-----------------Plots---------------------------
 ```
 
 ```{r echo=FALSE}
+#----------- Plot LSTM ------------------
 par(mfrow=c(1,1))
 plot(time(dat.ret[-1]),sqrt(as.numeric(unlist(y.lstm_tn)))*100,col="red",lwd=3,type="l",
      ylim=c(0,30),ylab="Return volatility forecasts",
@@ -170,11 +156,12 @@ plot(time(dat.ret[-1]),sqrt(as.numeric(unlist(y.lstm_mtn)))*100,col="black",lwd=
 par(new=TRUE)
 legend("topleft",c("LSTM_MTN","LSTM_TN"),col=c("black","red"),lty=c(2,1))
 abline(v=as.numeric(nsplit.dat),lwd=2)
-
 ```
 
+
+## GARCH(1,1)
 ```{R }
-# GARCH(1,1)
+#----------------- Fit GARCH ------------------
 garchfit = function(garch,Lag1){
   beta.val = rep(mean(Lag1),length(Lag1))
   for (i in 2:length(Lag1)){
@@ -187,7 +174,8 @@ garchfit = function(garch,Lag1){
   return(y.hat.g)
 }
 
-
+#------------------ GARCH log likelihood (loss) ------------------
+# Loss under TN
 GARCHfit_tn = function(params,x,y){
   omega = params[1]
   alphaL1 = params[2]
@@ -203,6 +191,7 @@ GARCHfit_tn = function(params,x,y){
   return(log.likelihood)
 }
 
+# Loss under MTN
 GARCHfit_mtn = function(params,x,y){
   omega = params[1]
   alphaL1 = params[2]
@@ -236,29 +225,29 @@ garch_mtn = optim(par = init.guess, fn=GARCHfit_mtn,
               x = (dat.train^2)[-length(dat.train)],
               y = dat.train[-1],)
 
-#============================================================
+
 
 #---------------GARCH(1,1) MTN and TN fitted-----------------
 y.garch_tn = garchfit(garch = garch_tn, Lag1 = dat.ret[-length(dat.ret)]^2 )
 y.garch_mtn = garchfit(garch = garch_mtn, Lag1 = dat.ret[-length(dat.ret)]^2 )
 
-# y.garch_tn$pars
-# y.garch_mtn$pars
-#--------Plot-----------------------------------------------
 ```
 
 ```{r }
+#----------- Plot GARCH ------------------
 par(mfrow=c(1,1))
 
 plot(sqrt(as.numeric(unlist(y.garch_tn)))*100,col="red",lwd=3,type="l",
      ylim=c(0,15),ylab="Return volatility forecasts",
-     xlab="Time", main= "Volatility of GARCH(1,1) vs. LSTM (000006.SZ)",)
+     xlab="Time", main= "Volatility of GARCH(1,1) under MTN and TN",)
 points(sqrt(as.numeric(y.garch_mtn))*100,type="l",lty=2)
 legend(x=0,y=15,c("Garch(1,1)","LSTM"),col=c("black","red"), lty=c(2,1))
 ```
 
 
+## Compare LSTM and GARCH
 ```{r echo=FALSE}
+#----------- Under TN assumption ------------------
 par(mfrow=c(1,1))
 plot(time(dat.ret[-1]),sqrt(as.numeric(unlist(y.lstm_tn)))*100,col="red",lwd=3,type="l",
      ylim=c(0,20),ylab="Return volatility forecasts", main="Volatility of LSTM vs GARCH(1,1) under TN", 
@@ -272,6 +261,7 @@ abline(v=as.numeric(nsplit.dat),lwd=2)
 ```
 
 ```{r echo=FALSE}
+#----------- Under MTN assumption ------------------
 par(mfrow=c(1,1))
 plot(time(dat.ret[-1]),sqrt(as.numeric(unlist(y.lstm_mtn)))*100,col="red",lwd=3,type="l",
      ylim=c(0,30),ylab="Return volatility forecasts",
