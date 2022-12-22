@@ -23,7 +23,7 @@ library(FinTS)
 ```{r}
 ############ Helper functions
 
-# Update variance in M-stpe
+# Update variance in M-step
 #  - a: lower bound of a truncated normal
 #  - b: upper bound of a truncated normal
 #  - mu: previous iteration's mean of one componenet
@@ -117,20 +117,11 @@ M_Gaussian <- function(Y, K, gamma, mu_old, Sigma_old) {
 }
 
 EM_mix_trunc_normal <- function(Y, K, pi0, mu0, Sigma0, Max_iter, eps){
-  
-  # Max_iter - maximum number of iteration
-  # eps - the iteration ends when the improvement of MLE is less than epsilon
-  
+ 
   mu <- mu0
   pi <- pi0
   Sigma <- Sigma0
-  
-  # E_step <- E_Gaussian(Y, K, mu, Sigma, pi)
-  # M_step <- M_Gaussian(Y, K, E_step$gamma, E_step$mu, E_step$Sigma)
-  # mu <- M_step$mu
-  # Sigma <- M_step$Sigma
-  # pi <- M_step$pi
-  # current_loglik <- E_step$Qold
+
   
   current_loglik <- 0
   for (iter in 1: Max_iter) {
