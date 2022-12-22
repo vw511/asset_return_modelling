@@ -1,0 +1,133 @@
+# EM algorithm - estimate the parameters for the mixture truncated normal distribution for modelling asset returns
+
+library(readr)
+library(truncnorm)
+
+############ Helper functions
+
+# Update variance in M-stpe
+#  - a: lower bound of a truncated normal
+#  - b: upper bound of a truncated normal
+#  - mu: previous iteration's mean of one componenet
+#  - sd: previous iteration's standard deviation of one component
+var_truncnorm <- function(a, b, mu, sd) {
+  za <- (a - mu)/sd
+  zb <- (b - mu)/sd
+  return(sd^2 + sd^3*(za*dnorm(a,mu,sd) - zb*dnorm(b,mu,sd) - 
+                        sd*(dnorm(a,mu,sd)-dnorm(b,mu,sd))^2))
+}
+
+
+############ Code up the EM algorithm for a mixture of K truncated Gaussian
+
+#  - Y: observed data (Y is one dimension here in the case of asset return)
+#  - K: number of mixture components
+#  - mu: a K*1 vector containing means of K truncated Gaussian models
+#  - Sigma: a K*1 vector containing variance of K truncated Gaussian models
+#  - pi: probability of data drawn from K truncated Gaussian models
+#  - Z: a n*K matrix latent variable
+#  - gamma: n*K matrix containing the conditional expectation of latent variable Z (posteriors)
+
+# E-step:
+E_Gaussian <- function(Y, K, mu, Sigma, pi) {
+  n <- length(Y)
+  Z <- matrix(0, nrow = n, ncol = K)
+  gamma <- matrix(0, nrow = n, ncol = K)
+  L <- min(Y)
+  U <- max(Y)
+  
+  
+  # compute the conditional expectation of latent variable Zij, which is gamma(i,j)
+  for (j in 1:K) {
+    Z[,j] <- pi[j]*dtruncnorm(Y, a= L, b= U, mean= mu[j], sd= sqrt(Sigma[j]))
+  }
+  
+  Zsum <- rowSums(Z) 
+  
+  for (j in 1:K){
+    gamma[,j] <- Z[,j]/Zsum # posteriors (normalized Zsum)
+  }
+  
+  # Compute Q(theta, theta_old), the Conditional Expectation of log-likelihood of completed data
+  Qold <- sum(log(Zsum, base = exp(1)))
+  
+  # export results
+  list("Qold"= Qold,
+       "gamma" = gamma,
+       "mu" = mu,
+       "Sigma" = Sigma)
+}
+
+# M-step:
+M_Gaussian <- function(Y, K, gamma, mu_old, Sigma_old) {
+  
+  n <- length(Y)
+  pi_vec <- rep(0, K)
+  mu_vec <- rep(0, K)
+  Sigma_vec <- rep(0, K)
+  L <- min(Y)
+  U <- max(Y)
+  
+  # update pi
+  for (j in 1:K) {
+    pi_vec[j] <- sum(gamma[,j])/n
+  }
+  
+  # update mu
+  first_moment <- etruncnorm(a= L, b= U, mean= mu_old, sd= sqrt(Sigma_old))
+  
+  for (j in 1:K) {
+    mu_vec[j] <- sum(gamma[,j]*Y)/sum(gamma[,j]) - (first_moment[j]-mu_old[j])
+  }
+  
+  # update Sigma
+  var_vec <- rep(0,K) 
+  for (j in 1:K) {
+    var_vec[j] <- var_truncnorm(L, U, mu_old[j], sqrt(Sigma_old[j]))
+  }
+  for (j in 1:K) {
+    Sigma_vec[j] <- sum(gamma[,j]*(Y-mu_vec[j])^2)/sum(gamma[,j]) + Sigma_old[j] - (var_vec[j] + (first_moment[j]-mu_old[j])^2)
+  }
+  
+  # export results
+  list("pi" = pi_vec,
+       "mu" = mu_vec,
+       "Sigma" = Sigma_vec)
+}
+
+
+EM_mix_trunc_normal <- function(Y, K, pi0, mu0, Sigma0, Max_iter, eps){
+  
+  mu <- mu0
+  pi <- pi0
+  Sigma <- Sigma0
+  
+  
+  current_loglik <- 0
+  for (iter in 1: Max_iter) {
+    E_step <- E_Gaussian(Y, K, mu, Sigma, pi)
+    M_step <- M_Gaussian(Y, K, E_step$gamma, E_step$mu, E_step$Sigma)
+    prev_loglik <- current_loglik
+    current_loglik <- E_step$Qold
+    mu <- M_step$mu
+    Sigma <- M_step$Sigma
+    pi <- M_step$pi
+    
+    if (iter == Max_iter) {
+      return(list("mu" = mu, "Sigma" = Sigma, "pi" = pi, "Iter" = iter, "Q" = E_step$Qold))
+    }
+    
+    err <- abs((prev_loglik - current_loglik))
+    
+    if (err < eps) {
+      return(list("mu" = mu, "Sigma" = Sigma, "pi" = pi, "Iter" = iter))
+      break
+    } 
+  }
+  return(list("mu" = mu, "Sigma" = Sigma, "pi" = pi, "Iter" = 'no for loop'))
+}
+
+
+
+
+

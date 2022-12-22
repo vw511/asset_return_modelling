@@ -83,9 +83,9 @@ E_Gaussian <- function(Y, K, mu, Sigma, pi) {
 M_Gaussian <- function(Y, K, gamma, mu_old, Sigma_old) {
   
   n <- length(Y)
-  pi_vec <- 0
-  mu_vec <- 0
-  Sigma_vec <- 0
+  pi_vec <- rep(0, K)
+  mu_vec <- rep(0, K)
+  Sigma_vec <- rep(0, K)
   L <- min(Y)
   U <- max(Y)
   
